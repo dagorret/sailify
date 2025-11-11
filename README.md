@@ -178,6 +178,20 @@ otherwise, they fallback to your local environment.
 
 ---
 
+## REmember
+```
+echo "WWWUSER=$(id -u)" >> .env
+echo "WWWGROUP=$(id -g)" >> .env
+```
+
+and
+```
+./vendor/bin/sail build --no-cache
+./vendor/bin/sail up -d
+./vendor/bin/sail composer install
+```
+
+
 ## 📜 License
 
 MIT License — free to use in personal or commercial projects.
