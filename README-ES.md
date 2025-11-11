@@ -1,133 +1,189 @@
-# Proyecto Salificar
+# 🚀 Instalación rápida de Laravel Sail en un proyecto existente
 
-Scripts Bash para **crear** o **sailificar** proyectos **Laravel** con **Sail**, seleccionando servicios y versiones de **PHP**/**Node.js**, con extras opcionales de administración (**pgAdmin** para Postgres y **phpMyAdmin** para MySQL/MariaDB).
-
-## Archivos
-
-- `nl.sh` — Crea un **nuevo** proyecto Laravel con Sail (Nuevo Laravel).
-- `en.sh` — Añade Sail y servicios a un **proyecto existente** (Existente Laravel).
-- `sail_aliases.sh` — Instala funciones/aliases para usar `php`, `artisan`, `npm`, etc. **sin** anteponer `sail`.
-
-## Requisitos
-
-- **Composer** instalado en el host.
-- **Docker** y **Docker Compose**.
-- Acceso a internet para descargar imágenes y paquetes.
+Este entorno automatiza la instalación y configuración de **Laravel Sail** con servicios comunes como **MariaDB**, **Mailpit**, **phpMyAdmin**, y herramientas adicionales.  
+Funciona incluso si **Composer no está instalado** en tu máquina, usando Docker o Podman como fallback.
 
 ---
 
-## Uso rápido
+## 🧩 Requisitos previos
 
-### 1) Nuevo proyecto (`nl.sh`)
+Antes de ejecutar el script:
+
+- Tener instalado **Docker** o **Podman** (uno de los dos es suficiente).
+- Un proyecto Laravel existente con `composer.json`.
+- Acceso a Internet para descargar imágenes base.
+- Permisos de ejecución sobre el script (`chmod +x en.sh`).
+
+---
+
+## ⚙️ Ejecución del script
+
+Ejecutá el script desde el directorio raíz del proyecto Laravel:
 
 ```bash
-chmod +x nl.sh
-./nl.sh --name miapp \
-  --php 8.3 \
-  --node 20 \
-  --services "sqlite,mailpit"
-cd miapp
+./en.sh --services "mariadb,mailpit" --phpmyadmin true --php 8.2
+```
+
+O si no tenés permisos de ejecución:
+
+```bash
+bash en.sh --services "mariadb,mailpit" --phpmyadmin true --php 8.2
+```
+
+### 🔧 Parámetros disponibles
+
+| Opción | Descripción | Valor por defecto |
+|--------|--------------|-------------------|
+| `--project-dir DIR` | Directorio del proyecto | `.` |
+| `--php X.Y` | Versión de PHP para Sail | `8.3` |
+| `--node N` | Versión de Node.js | `20` |
+| `--services LISTA` | Lista de servicios Sail | `mysql,mariadb,pgsql,redis,memcached,meilisearch,minio,mailpit,selenium` |
+| `--phpmyadmin true|false` | Agrega phpMyAdmin si hay MySQL/MariaDB | `true` |
+| `--phpmyadmin-port PORT` | Puerto phpMyAdmin | `8081` |
+| `--pgadmin-email EMAIL` | Email de pgAdmin (si usás pgsql) | `admin@example.com` |
+| `--pgadmin-pass PASS` | Contraseña pgAdmin | `secret` |
+| `--pgadmin-port PORT` | Puerto pgAdmin | `5050` |
+
+---
+
+## 🧱 Qué hace el script
+
+1. **Instala Laravel Sail** (`laravel/sail`) ignorando temporalmente extensiones faltantes (`intl`, `gd`).
+2. Detecta si Composer está instalado localmente; si no, usa `composer:2` dentro de Docker/Podman.
+3. Ejecuta `php artisan sail:install` con los servicios especificados.
+4. Detecta el Dockerfile real de Sail en  
+   `vendor/laravel/sail/runtimes/<PHP_VERSION>/Dockerfile`
+   y lo modifica para:
+   - Inyectar las extensiones **intl** y **gd**.
+   - Actualizar la versión de **Node.js**.
+5. Actualiza automáticamente tu `docker-compose.yml` para apuntar al runtime correcto.
+6. Si usás MySQL o MariaDB, agrega **phpMyAdmin** automáticamente.
+7. Si usás PostgreSQL, agrega **pgAdmin**.
+8. Configura SQLite si fue seleccionado.
+
+---
+
+## 🧰 Comandos posteriores a la instalación
+
+### 🔨 1. Construir la imagen (aplica intl/gd y Node)
+
+```bash
+./vendor/bin/sail build --no-cache
+```
+
+### 🚀 2. Levantar los contenedores
+
+```bash
 ./vendor/bin/sail up -d
+```
+
+### 🧩 3. Verificar extensiones instaladas
+
+```bash
+./vendor/bin/sail php -m | grep -Ei 'intl|gd' || echo 'extensiones NO cargadas'
+```
+
+### 📦 4. Instalar dependencias
+
+```bash
+./vendor/bin/sail composer install
+```
+
+### 🗃️ 5. Migrar la base de datos
+
+```bash
 ./vendor/bin/sail artisan migrate
 ```
 
-**Con Postgres + pgAdmin**:
-```bash
-./nl.sh --name miapp --services "pgsql,redis,mailpit" \
-  --pgadmin-email admin@demo.test --pgadmin-pass superseguro --pgadmin-port 5050
-```
+---
 
-**Con MySQL + phpMyAdmin**:
-```bash
-./nl.sh --name miapp --services "mysql,redis,mailpit" \
-  --phpmyadmin true --phpmyadmin-port 8081
-```
+## 🧾 Configuración de la base de datos
 
-### 2) Proyecto existente (`en.sh`)
+Si usás **MariaDB**, asegurate que tu `.env` tenga algo como:
 
-```bash
-chmod +x en.sh
-# En la raíz del proyecto Laravel:
-./en.sh --php 8.3 --node 20 --services "sqlite,mailpit"
-./vendor/bin/sail up -d
-./vendor/bin/sail artisan migrate
-```
-
-**Con Postgres + pgAdmin**:
-```bash
-./en.sh --services "pgsql,redis,mailpit" \
-  --pgadmin-email admin@demo.test --pgadmin-pass superseguro
-```
-
-**Con MySQL + phpMyAdmin**:
-```bash
-./en.sh --services "mysql,redis,mailpit" \
-  --phpmyadmin true --phpmyadmin-port 8081
+```env
+DB_CONNECTION=mysql
+DB_HOST=mariadb
+DB_PORT=3306
+DB_DATABASE=laravel
+DB_USERNAME=sail
+DB_PASSWORD=password
 ```
 
 ---
 
-## Servicios soportados (`--services`)
+## 🌐 Servicios incluidos
 
-Podés combinar cualquiera:
-
-- `mysql` — MySQL
-- `mariadb` — MariaDB
-- `pgsql` — PostgreSQL
-- `sqlite` — **sin contenedor**, base de datos en archivo `database/database.sqlite`
-- `redis` — Redis
-- `memcached` — Memcached
-- `meilisearch` — Meilisearch (búsqueda full-text)
-- `minio` — S3 compatible
-- `mailpit` — Captura/visualiza emails en desarrollo (UI en `http://localhost:8025`)
-- `selenium` — Navegador para pruebas end‑to‑end
-
-**Extras auto-inyectados:**
-- `pgAdmin` → si elegís `pgsql` (UI en `http://localhost:5050` por defecto)
-- `phpMyAdmin` → si elegís `mysql` o `mariadb` (UI en `http://localhost:8081` por defecto)
+| Servicio | URL / Puerto | Descripción |
+|-----------|---------------|--------------|
+| Laravel App | http://localhost | Aplicación principal |
+| phpMyAdmin | http://localhost:8081 | UI para MariaDB/MySQL |
+| Mailpit (Web) | http://localhost:8025 | Visualizar correos enviados |
+| Mailpit (SMTP) | `mailpit:1025` | Servidor SMTP local |
+| MariaDB | `mariadb:3306` | Base de datos principal |
 
 ---
 
-## Variables y archivos
+## 🧰 Tips útiles
 
-- `.env` se ajusta automáticamente para el motor elegido:
-  - **Postgres**: `DB_CONNECTION=pgsql`, host `pgsql`, puerto `5432`.
-  - **MySQL/MariaDB**: `DB_CONNECTION=mysql` (o `mariadb`), host `mysql`/`mariadb`, puerto `3306`.
-  - **SQLite**: `DB_CONNECTION=sqlite`, `DB_DATABASE=/var/www/html/database/database.sqlite`.
-- Se crea `database/database.sqlite` si elegís `sqlite`.
-- Se añaden variables `PGADMIN_DEFAULT_EMAIL`, `PGADMIN_DEFAULT_PASSWORD`, `PGADMIN_PORT` y `PHPMYADMIN_PORT` si corresponde.
+- Para reiniciar los contenedores:
 
----
-
-## Alias sin `sail`
-
-```bash
-chmod +x sail_aliases.sh
-./sail_aliases.sh
-# Abrí nueva terminal o:
-source ~/.sail-aliases.sh
-
-# Ejemplos
-artisan migrate
-npm run dev
-php -v
-```
-
-> Los wrappers detectan `vendor/bin/sail`: si existe, ejecutan dentro del contenedor; si no, usan el binario local.
-
----
-
-## Tips
-
-- Si cambiás la versión de **PHP** o **Node.js**, el Dockerfile se edita; luego **reconstruí**:
   ```bash
+  ./vendor/bin/sail restart
+  ```
+
+- Para entrar a la consola PHP dentro del contenedor:
+
+  ```bash
+  ./vendor/bin/sail shell
+  ```
+
+- Para ejecutar migraciones y seeders en una sola línea:
+
+  ```bash
+  ./vendor/bin/sail artisan migrate:fresh --seed
+  ```
+
+- Para destruir todo y empezar limpio:
+
+  ```bash
+  ./vendor/bin/sail down -v
+  ```
+
+---
+
+## ⚠️ Problemas comunes
+
+| Error | Causa / Solución |
+|-------|------------------|
+| `composer: command not found` | El script usa `composer:2` dentro de Docker automáticamente. No hace falta tenerlo instalado. |
+| `TTY mode requires /dev/tty` | Advertencia inofensiva. Ignorala. |
+| `intl` o `gd` faltan | Reejecutá `./vendor/bin/sail build --no-cache`. |
+| `Permission denied` | Corré `chmod +x en.sh` o `bash en.sh ...` |
+| `No pude localizar Dockerfile` | Asegurate de haber ejecutado el script dentro del proyecto Laravel con Sail instalado. |
+
+---
+
+## 💡 Recomendaciones finales
+
+- Si vas a trabajar con distintos proyectos Laravel, mantené este script en tu `$HOME/bin` y ejecutalo desde cualquier repo.
+- Si usás **Arch Linux**, asegurate de tener `docker`, `podman`, `bash` y `dos2unix` instalados.
+- Para cambiar de PHP más adelante, podés volver a ejecutar:
+  ```bash
+  ./en.sh --php 8.3
   ./vendor/bin/sail build --no-cache
   ```
-- **SQLite + Mailpit** es un stack súper liviano para desarrollo.
-- Para ambientes con `pgsql`, `mysql` o `mariadb`, podés desactivar phpMyAdmin con `--phpmyadmin false`.
+- Si tu equipo usa Git, agregá `vendor/` y `docker-compose.override.yml` al `.gitignore`.
 
 ---
 
-## Licencia
+## ✅ Conclusión
 
-MIT — usalo libremente en tus proyectos.
+Con este setup:
+
+- No necesitás tener PHP ni Composer en tu host.
+- Todo corre dentro de contenedores Docker Sail.
+- Las extensiones `intl` y `gd` ya están habilitadas.
+- MariaDB, phpMyAdmin y Mailpit funcionan automáticamente.
+
+Tu entorno Laravel queda listo para desarrollo local con un solo comando. 🚀
