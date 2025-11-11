@@ -177,6 +177,21 @@ DB_PASSWORD=password
 
 ---
 
+## Recuerde
+
+## REmember
+```
+echo "WWWUSER=$(id -u)" >> .env
+echo "WWWGROUP=$(id -g)" >> .env
+```
+
+and
+```
+./vendor/bin/sail build --no-cache
+./vendor/bin/sail up -d
+./vendor/bin/sail composer install
+```
+
 ## ✅ Conclusión
 
 Con este setup:
