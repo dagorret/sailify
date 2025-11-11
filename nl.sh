@@ -1,45 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ========== Config por defecto (sobrescribible por flags o variables de entorno) ==========
-APP_NAME=""
-PHP_VERSION="${PHP_VERSION:-8.3}"     # Versión de PHP para la imagen de Sail (laravelsail/phpXY)
-NODE_VERSION="${NODE_VERSION:-20}"    # Node.js para el contenedor de app
+# ========== Defaults ==========
+PROJECT_NAME=""                                # obligatorio: --name <carpeta>
+PHP_VERSION="${PHP_VERSION:-8.3}"              # 8.3 / 8.2 / 8.1
+NODE_VERSION="${NODE_VERSION:-20}"
 SERVICES_DEFAULT="mysql,mariadb,pgsql,redis,memcached,meilisearch,minio,mailpit,selenium"
-SERVICES="${SERVICES:-$SERVICES_DEFAULT}"
+SERVICES="${SERVICES:-sqlite,mailpit}"         # por defecto liviano
+PGADMIN_EMAIL="${PGADMIN_EMAIL:-admin@example.com}"
+PGADMIN_PASSWORD="${PGADMIN_PASSWORD:-secret}"
+PGADMIN_PORT="${PGADMIN_PORT:-5050}"
+PHPMYADMIN="${PHPMYADMIN:-true}"
+PHPMYADMIN_PORT="${PHPMYADMIN_PORT:-8081}"
 
-# Extras opcionales de administración web
-PGADMIN_EMAIL="${PGADMIN_EMAIL:-admin@example.com}"     # Usuario inicial de pgAdmin
-PGADMIN_PASSWORD="${PGADMIN_PASSWORD:-secret}"          # Password inicial de pgAdmin
-PGADMIN_PORT="${PGADMIN_PORT:-5050}"                    # Puerto host para pgAdmin
-PHPMYADMIN="${PHPMYADMIN:-true}"                        # Incluir phpMyAdmin si hay mysql o mariadb
-PHPMYADMIN_PORT="${PHPMYADMIN_PORT:-8081}"              # Puerto host para phpMyAdmin
-
-# ========== Ayuda ==========
 usage() {
 cat <<EOF
 Uso: $(basename "$0") --name NOMBRE [opciones]
 
-Crea un proyecto Laravel nuevo y lo configura con Sail y servicios seleccionados.
+Crea un proyecto Laravel nuevo con Sail completamente configurado, sin requerir Composer en el host.
 
 Opciones:
-  --name NOMBRE           Nombre de la carpeta/proyecto (obligatorio)
-  --php X.Y               Versión PHP p/ Sail (default: ${PHP_VERSION})
+  --name NOMBRE           Carpeta/Nombre del proyecto (obligatorio)
+  --php X.Y               Versión PHP (default: ${PHP_VERSION})
   --node N                Versión Node.js (default: ${NODE_VERSION})
-  --services LISTA        Servicios Sail (default: ${SERVICES_DEFAULT})
+  --services LISTA        Servicios Sail (default: ${SERVICES})
   --pgadmin-email EMAIL   Email pgAdmin (default: ${PGADMIN_EMAIL})
-  --pgadmin-pass PASS     Password pgAdmin (default: ****)
+  --pgadmin-pass PASS     Password pgAdmin (default: ${PGADMIN_PASSWORD})
   --pgadmin-port PORT     Puerto pgAdmin (default: ${PGADMIN_PORT})
   --phpmyadmin true|false Incluir phpMyAdmin si hay mysql/mariadb (default: ${PHPMYADMIN})
   --phpmyadmin-port PORT  Puerto phpMyAdmin (default: ${PHPMYADMIN_PORT})
   -h, --help              Ayuda
+
+Ejemplos:
+  $(basename "$0") --name myapp --services "sqlite,mailpit"
+  $(basename "$0") --name myapp --php 8.2 --services "mariadb,redis,mailpit" --phpmyadmin true
 EOF
 }
 
-# ========== Parseo de argumentos ==========
+# ========== Parse args ==========
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --name) APP_NAME="$2"; shift 2;;
+    --name) PROJECT_NAME="$2"; shift 2;;
     --php) PHP_VERSION="$2"; shift 2;;
     --node) NODE_VERSION="$2"; shift 2;;
     --services) SERVICES="$2"; shift 2;;
@@ -53,73 +54,137 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ========== Validaciones básicas ==========
-if [[ -z "${APP_NAME}" ]]; then
-  echo "❌ Debes indicar --name NOMBRE"
-  usage; exit 1
-fi
-if ! command -v composer >/dev/null 2>&1; then
-  echo "❌ composer no está instalado en el host."
+if [[ -z "${PROJECT_NAME}" ]]; then
+  echo "❌ Falta --name NOMBRE"
+  usage
   exit 1
 fi
 
-# ========== Crear proyecto ==========
-echo "🆕 Creando proyecto Laravel: ${APP_NAME}"
-composer create-project laravel/laravel "${APP_NAME}"
+# ========== Helpers ==========
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# ========== Entrar al proyecto y delegar en lógica común (ver función) ==========
-cd "${APP_NAME}"
+# Detectar runtime de contenedores (docker o podman)
+RUNTIME=""
+if has_cmd docker; then
+  RUNTIME="docker"
+elif has_cmd podman; then
+  RUNTIME="podman"
+fi
 
-apply_sail_and_services() {
-  local php_v="$1" node_v="$2" services="$3" \
-        pgadmin_email="$4" pgadmin_pass="$5" pgadmin_port="$6" \
-        phpmyadmin="$7" phpmyadmin_port="$8"
+if [[ -z "${RUNTIME}" ]]; then
+  echo "❌ Necesitás Docker o Podman instalado."
+  exit 1
+fi
 
-  # ----- Instalar Sail -----
-  echo "📦 Instalando laravel/sail..."
-  composer require laravel/sail --dev --no-interaction --no-progress
-  composer dump-autoload --no-interaction >/dev/null 2>&1 || true
+# Wrapper para ejecutar composer/php dentro de contenedor con UID/GID del host
+container_uid="$(id -u)"
+container_gid="$(id -g)"
+container_workdir="/app"
+COMPOSER_CACHE_DIR="${HOME}/.cache/composer"
+mkdir -p "${COMPOSER_CACHE_DIR}"
 
-  # ----- Generar docker-compose con servicios -----
-  echo "⚙️ Ejecutando php artisan sail:install --with=\"$services\""
-  php artisan sail:install --with="$services" --no-interaction
+run_in_container() {
+  ${RUNTIME} run --rm \
+    -u "${container_uid}:${container_gid}" \
+    -v "${PWD}:${container_workdir}" \
+    -v "${COMPOSER_CACHE_DIR}:/tmp/composer-cache" \
+    -e COMPOSER_CACHE_DIR=/tmp/composer-cache \
+    -w "${container_workdir}" \
+    "$@"
+}
 
-  # ----- Detectar Dockerfile de la app de Sail -----
-  local DOCKERFILE=""
-  DOCKERFILE=$(grep -RIl "laravelsail/php" docker dockerfiles . 2>/dev/null | head -n1 || true)
-  if [[ -n "${DOCKERFILE}" && -f "${DOCKERFILE}" ]]; then
-    echo "🧩 Ajustando Dockerfile: ${DOCKERFILE}"
+composer_c() { run_in_container composer:2 composer "$@"; }
+php_c()      { run_in_container composer:2 php "$@"; }
 
-    # Ajustar tag base de PHP (8.3 → php83).
-    local PHP_TAG
-    PHP_TAG="$(echo "$php_v" | tr -d '.')"
-    sed -i.bak -E "s|(laravelsail/php)[0-9]+(-composer)?|\1${PHP_TAG}\2|g" "${DOCKERFILE}" || true
+# ========== Crear proyecto base ==========
+if [[ -e "${PROJECT_NAME}" ]]; then
+  echo "❌ La carpeta '${PROJECT_NAME}' ya existe."
+  exit 1
+fi
 
-    # Inyectar/ajustar ARG NODE_VERSION
-    if grep -qE 'ARG NODE_VERSION=' "${DOCKERFILE}"; then
-      sed -i.bak -E "s|ARG NODE_VERSION=.*|ARG NODE_VERSION=${node_v}|g" "${DOCKERFILE}"
-    else
-      awk -v nv="${node_v}" '
-        BEGIN{printed=0}
-        /^FROM / && printed==0 { print; print "ARG NODE_VERSION=" nv; printed=1; next }
-        { print }
-      ' "${DOCKERFILE}" > "${DOCKERFILE}.tmp" && mv "${DOCKERFILE}.tmp" "${DOCKERFILE}"
-    fi
-  else
-    echo "⚠️ No pude localizar el Dockerfile de Sail para forzar PHP/Node. Ajustá manual si lo necesitás."
+echo "📦 Creando proyecto Laravel: ${PROJECT_NAME}"
+composer_c create-project --no-interaction laravel/laravel "${PROJECT_NAME}"
+
+cd "${PROJECT_NAME}"
+
+# .env inicial
+cp .env.example .env
+
+# ========== Instalar Sail ignorando platform-reqs (intl/gd) solo en este paso ==========
+echo "➕ Agregando laravel/sail (bootstrap, ignorando requisitos de plataforma)..."
+composer_c require laravel/sail --dev --no-interaction --no-progress --ignore-platform-reqs || {
+  echo "❌ Falló composer require laravel/sail."
+  exit 1
+}
+composer_c dump-autoload --no-interaction >/dev/null 2>&1 || true
+
+# ========== Sail install con servicios ==========
+echo "⚙️ Ejecutando php artisan sail:install --with='${SERVICES}'"
+php_c artisan sail:install --with="${SERVICES}" --no-interaction
+
+# ========== Forzar runtime PHP correcto y ajustar Dockerfile (intl + gd + Node) ==========
+COMPOSE="docker-compose.yml"
+RUNTIME_DIR="vendor/laravel/sail/runtimes/${PHP_VERSION}"
+DOCKERFILE="${RUNTIME_DIR}/Dockerfile"
+
+if [[ -f "${DOCKERFILE}" ]]; then
+  echo "🧩 Ajustando Dockerfile: ${DOCKERFILE}"
+  # Apuntar compose a la versión PHP seleccionada
+  if [[ -f "${COMPOSE}" ]]; then
+    sed -i.bak -E "s|runtimes/[0-9]+\.[0-9]+|runtimes/${PHP_VERSION}|g" "${COMPOSE}" || true
   fi
 
-  # ----- Insertar pgAdmin si está pgsql en la composición -----
-  local COMPOSE="docker-compose.yml"
-  if [[ -f "${COMPOSE}" ]] && echo "$services" | grep -q "pgsql"; then
+  # Asegurar ARG NODE_VERSION
+  if grep -qE '^ARG[[:space:]]+NODE_VERSION=' "${DOCKERFILE}"; then
+    sed -i.bak -E "s|^ARG[[:space:]]+NODE_VERSION=.*|ARG NODE_VERSION=${NODE_VERSION}|g" "${DOCKERFILE}"
+  else
+    awk -v nv="${NODE_VERSION}" '
+      BEGIN{printed=0}
+      /^FROM[[:space:]]/ && printed==0 { print; print "ARG NODE_VERSION=" nv; printed=1; next }
+      { print }
+    ' "${DOCKERFILE}" > "${DOCKERFILE}.tmp" && mv "${DOCKERFILE}.tmp" "${DOCKERFILE}"
+  fi
+
+  # Inyectar intl + gd si no están
+  need_inject="false"
+  grep -qiE 'docker-php-ext-install[[:space:]].*intl' "${DOCKERFILE}" || need_inject="true"
+  grep -qiE 'docker-php-ext-install[[:space:]].*gd'   "${DOCKERFILE}" || need_inject="true"
+  if [[ "${need_inject}" == "true" ]]; then
+    echo "➕ Inyectando intl y gd en ${DOCKERFILE}"
+    awk '
+      BEGIN{inserted=0}
+      /^FROM[[:space:]]/ && inserted==0 {
+        print
+        print "RUN apt-get update \\"
+        print "    && apt-get install -y --no-install-recommends \\"
+        print "       libicu-dev libjpeg62-turbo-dev libpng-dev libfreetype6-dev libwebp-dev \\"
+        print "    && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \\"
+        print "    && docker-php-ext-install gd \\"
+        print "    && docker-php-ext-configure intl \\"
+        print "    && docker-php-ext-install intl \\"
+        print "    && rm -rf /var/lib/apt/lists/*"
+        inserted=1
+        next
+      }
+      { print }
+    ' "${DOCKERFILE}" > "${DOCKERFILE}.tmp" && mv "${DOCKERFILE}.tmp" "${DOCKERFILE}"
+  fi
+else
+  echo "⚠️ No encontré ${DOCKERFILE}. Sail usará su runtime por defecto."
+fi
+
+# ========== Extras: pgAdmin / phpMyAdmin en docker-compose ==========
+if [[ -f "${COMPOSE}" ]]; then
+  # pgAdmin si hay pgsql
+  if echo "${SERVICES}" | grep -q "pgsql"; then
     if ! grep -qE '^\s*pgadmin:' "${COMPOSE}"; then
-      echo "➕ Agregando servicio pgadmin a ${COMPOSE}"
+      echo "➕ Agregando pgAdmin a ${COMPOSE}"
       cat >> "${COMPOSE}" <<YAML
 
   pgadmin:
     image: dpage/pgadmin4:latest
     ports:
-      - '\${PGADMIN_PORT:-${pgadmin_port}}:80'
+      - '\${PGADMIN_PORT:-${PGADMIN_PORT}}:80'
     environment:
       PGADMIN_DEFAULT_EMAIL: \${PGADMIN_DEFAULT_EMAIL}
       PGADMIN_DEFAULT_PASSWORD: \${PGADMIN_DEFAULT_PASSWORD}
@@ -130,7 +195,7 @@ apply_sail_and_services() {
     networks:
       - sail
 YAML
-      # Asegurar volumen
+      # asegurar volumen
       if ! grep -q '^volumes:' "${COMPOSE}"; then
         cat >> "${COMPOSE}" <<'YAML'
 
@@ -146,36 +211,32 @@ YAML
 YAML
         fi
       fi
+      # .env defaults
+      grep -q '^PGADMIN_DEFAULT_EMAIL=' .env || echo "PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL}" >> .env
+      grep -q '^PGADMIN_DEFAULT_PASSWORD=' .env || echo "PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}" >> .env
+      grep -q '^PGADMIN_PORT=' .env || echo "PGADMIN_PORT=${PGADMIN_PORT}" >> .env
     fi
-    # Ajustes .env
-    if [[ -f .env ]]; then
-      sed -i.bak -E 's/^DB_CONNECTION=.*/DB_CONNECTION=pgsql/' .env || true
-      sed -i.bak -E 's/^DB_HOST=.*/DB_HOST=pgsql/' .env || true
-      sed -i.bak -E 's/^DB_PORT=.*/DB_PORT=5432/' .env || true
-      sed -i.bak -E 's/^DB_DATABASE=.*/DB_DATABASE=laravel/' .env || true
-      sed -i.bak -E 's/^DB_USERNAME=.*/DB_USERNAME=sail/' .env || true
-      sed -i.bak -E 's/^DB_PASSWORD=.*/DB_PASSWORD=password/' .env || true
-      grep -q '^PGADMIN_DEFAULT_EMAIL=' .env || echo "PGADMIN_DEFAULT_EMAIL=${pgadmin_email}" >> .env
-      grep -q '^PGADMIN_DEFAULT_PASSWORD=' .env || echo "PGADMIN_DEFAULT_PASSWORD=${pgadmin_pass}" >> .env
-      grep -q '^PGADMIN_PORT=' .env || echo "PGADMIN_PORT=${pgadmin_port}" >> .env
-    fi
+    # Ajustar .env para PG
+    sed -i.bak -E 's/^DB_CONNECTION=.*/DB_CONNECTION=pgsql/' .env || true
+    sed -i.bak -E 's/^DB_HOST=.*/DB_HOST=pgsql/' .env || true
+    sed -i.bak -E 's/^DB_PORT=.*/DB_PORT=5432/' .env || true
+    sed -i.bak -E 's/^DB_DATABASE=.*/DB_DATABASE=laravel/' .env || true
+    sed -i.bak -E 's/^DB_USERNAME=.*/DB_USERNAME=sail/' .env || true
+    sed -i.bak -E 's/^DB_PASSWORD=.*/DB_PASSWORD=password/' .env || true
   fi
 
-  # ----- Insertar phpMyAdmin si hay mysql/mariadb y está habilitado -----
-  if [[ -f "${COMPOSE}" && "${phpmyadmin}" == "true" ]]; then
-    if grep -qE '^\s*(mysql|mariadb):' "${COMPOSE}"; then
-      if ! grep -qE '^\s*phpmyadmin:' "${COMPOSE}"; then
-        echo "➕ Agregando servicio phpmyadmin a ${COMPOSE}"
-        local PMA_TARGET="mysql"
-        grep -qE '^\s*mariadb:' "${COMPOSE}" && PMA_TARGET="mariadb"
-        grep -qE '^\s*mysql:' "${COMPOSE}" && PMA_TARGET="mysql"
-
-        cat >> "${COMPOSE}" <<YAML
+  # phpMyAdmin si hay mysql/mariadb y está habilitado
+  if [[ "${PHPMYADMIN}" == "true" ]] && echo "${SERVICES}" | grep -Eq "mysql|mariadb"; then
+    if ! grep -qE '^\s*phpmyadmin:' "${COMPOSE}"; then
+      echo "➕ Agregando phpMyAdmin a ${COMPOSE}"
+      PMA_TARGET="mysql"
+      grep -qE '^\s*mariadb:' "${COMPOSE}" && PMA_TARGET="mariadb"
+      cat >> "${COMPOSE}" <<YAML
 
   phpmyadmin:
     image: phpmyadmin:latest
     ports:
-      - '\${PHPMYADMIN_PORT:-${phpmyadmin_port}}:80'
+      - '\${PHPMYADMIN_PORT:-${PHPMYADMIN_PORT}}:80'
     environment:
       PMA_HOST: ${PMA_TARGET}
       PMA_PORT: 3306
@@ -184,36 +245,65 @@ YAML
     networks:
       - sail
 YAML
-        if [[ -f .env ]]; then
-          grep -q '^PHPMYADMIN_PORT=' .env || echo "PHPMYADMIN_PORT=${phpmyadmin_port}" >> .env
-        fi
-      fi
+      grep -q '^PHPMYADMIN_PORT=' .env || echo "PHPMYADMIN_PORT=${PHPMYADMIN_PORT}" >> .env
     fi
   fi
+fi
 
-  # ----- Caso SQLite -----
-  if echo "$services" | grep -q "sqlite"; then
-    echo "🗃️ Configurando SQLite"
-    mkdir -p database
-    touch database/database.sqlite
-    if [[ -f .env ]]; then
-      sed -i.bak -E 's/^DB_CONNECTION=.*/DB_CONNECTION=sqlite/' .env || true
-      if grep -q '^DB_DATABASE=' .env; then
-        sed -i.bak -E 's|^DB_DATABASE=.*|DB_DATABASE=/var/www/html/database/database.sqlite|' .env
-      else
-        echo "DB_DATABASE=/var/www/html/database/database.sqlite" >> .env
-      fi
-      grep -q '^DB_FOREIGN_KEYS=' .env || echo "DB_FOREIGN_KEYS=true" >> .env
-    fi
+# ========== SQLite ajuste ==========
+if echo "${SERVICES}" | grep -q "sqlite"; then
+  echo "🗃️ Configurando SQLite"
+  mkdir -p database
+  touch database/database.sqlite
+  sed -i.bak -E 's/^DB_CONNECTION=.*/DB_CONNECTION=sqlite/' .env || true
+  if grep -q '^DB_DATABASE=' .env; then
+    sed -i.bak -E 's|^DB_DATABASE=.*|DB_DATABASE=/var/www/html/database/database.sqlite|' .env
+  else
+    echo "DB_DATABASE=/var/www/html/database/database.sqlite" >> .env
   fi
+  grep -q '^DB_FOREIGN_KEYS=' .env || echo "DB_FOREIGN_KEYS=true" >> .env
+fi
 
-  echo "✅ Sail listo. Levantá con: ./vendor/bin/sail up -d"
-  echo "   PHP: ${php_v} · Node: ${node_v}"
-}
+# ========== UID/GID persistentes para evitar permisos ==========
+echo "➕ Estableciendo WWWUSER/WWWGROUP en .env"
+grep -q '^WWWUSER=' .env || echo "WWWUSER=${container_uid}" >> .env
+grep -q '^WWWGROUP=' .env || echo "WWWGROUP=${container_gid}" >> .env
 
-apply_sail_and_services "${PHP_VERSION}" "${NODE_VERSION}" "${SERVICES}" \
-                        "${PGADMIN_EMAIL}" "${PGADMIN_PASSWORD}" "${PGADMIN_PORT}" \
-                        "${PHPMYADMIN}" "${PHPMYADMIN_PORT}"
+# ========== Permisos en host (storage, cache) ==========
+echo "🔐 Ajustando permisos en storage y bootstrap/cache"
+chmod -R u+rwX,g+rwX storage bootstrap/cache || true
 
-echo "🎉 Proyecto creado en $(pwd)"
-echo "👉 Sugerido: ./vendor/bin/sail up -d && ./vendor/bin/sail artisan migrate"
+# ========== Build + Up ==========
+echo "🔨 Construyendo imágenes (aplicando intl/gd y Node ${NODE_VERSION})"
+./vendor/bin/sail build --no-cache
+echo "🚀 Levantando contenedores"
+./vendor/bin/sail up -d
+
+# ========== Generar APP_KEY, link storage y migrar si hay DB ==========
+echo "🔑 Generando APP_KEY"
+./vendor/bin/sail artisan key:generate --force || true
+echo "🔗 Creando storage:link"
+./vendor/bin/sail artisan storage:link || true
+
+if echo "${SERVICES}" | grep -Eq "mysql|mariadb|pgsql"; then
+  echo "🗄️ Ejecutando migraciones"
+  ./vendor/bin/sail artisan migrate || true
+fi
+
+# ========== Info final ==========
+echo
+echo "✅ Proyecto listo en $(pwd)"
+echo "➡️ URL app:          http://localhost"
+if echo "${SERVICES}" | grep -q "mailpit"; then
+  echo "➡️ Mailpit UI:       http://localhost:8025 (SMTP: mailpit:1025)"
+fi
+if echo "${SERVICES}" | grep -Eq "mysql|mariadb"; then
+  echo "➡️ phpMyAdmin:       http://localhost:${PHPMYADMIN_PORT} (host: mariadb/mysql)"
+fi
+if echo "${SERVICES}" | grep -q "pgsql"; then
+  echo "➡️ pgAdmin:          http://localhost:${PGADMIN_PORT}"
+fi
+echo
+echo "Comandos útiles:"
+echo "  ./vendor/bin/sail artisan migrate"
+echo "  ./vendor/bin/sail npm install && ./vendor/bin/sail npm run dev"
