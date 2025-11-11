@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ========== Defaults ==========
 PROJECT_DIR="."                                  # Directorio del proyecto existente
-PHP_VERSION="${PHP_VERSION:-8.3}"
+PHP_VERSION="${PHP_VERSION:-8.3}"               # e.g. 8.3, 8.2
 NODE_VERSION="${NODE_VERSION:-20}"
 SERVICES_DEFAULT="mysql,mariadb,pgsql,redis,memcached,meilisearch,minio,mailpit,selenium"
 SERVICES="${SERVICES:-$SERVICES_DEFAULT}"
@@ -20,6 +20,7 @@ cat <<EOF
 Uso: $(basename "$0") [opciones]
 
 Instala/configura Sail en un proyecto Laravel existente y agrega servicios opcionales.
+Si no hay Composer en el host, usa docker/podman con la imagen composer:2.
 
 Opciones:
   --project-dir DIR       Directorio del proyecto (default: .)
@@ -56,42 +57,169 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ========== Helpers ==========
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Detectar runtime de contenedores (docker o podman)
+RUNTIME=""
+if has_cmd docker; then
+  RUNTIME="docker"
+elif has_cmd podman; then
+  RUNTIME="podman"
+fi
+
+# Wrapper para ejecutar Composer y PHP (dentro o fuera de contenedor)
+USE_CONTAINER_COMPOSER="false"
+if ! has_cmd composer; then
+  if [[ -z "${RUNTIME}" ]]; then
+    echo "❌ composer no está instalado y tampoco encontré docker/podman."
+    echo "   Instalá Composer o Docker/Podman para continuar."
+    exit 1
+  fi
+  USE_CONTAINER_COMPOSER="true"
+fi
+
+# Construir comandos según disponibilidad
+container_uid="$(id -u)"
+container_gid="$(id -g)"
+container_workdir="/app"
+
+if [[ "${USE_CONTAINER_COMPOSER}" == "true" ]]; then
+  COMPOSER_CACHE_DIR="${HOME}/.cache/composer"
+  mkdir -p "${COMPOSER_CACHE_DIR}"
+
+  run_in_container() {
+    ${RUNTIME} run --rm \
+      -u "${container_uid}:${container_gid}" \
+      -v "${PWD}:${container_workdir}" \
+      -v "${COMPOSER_CACHE_DIR}:/tmp/composer-cache" \
+      -e COMPOSER_CACHE_DIR=/tmp/composer-cache \
+      -w "${container_workdir}" \
+      "$@"
+  }
+
+  COMPOSER_CMD=(run_in_container composer:2 composer)
+  PHP_CMD=(run_in_container composer:2 php)
+else
+  COMPOSER_CMD=(composer)
+  PHP_CMD=(php)
+fi
+
+composer_exec() { "${COMPOSER_CMD[@]}" "$@"; }
+php_exec() { "${PHP_CMD[@]}" "$@"; }
+
 # ========== Validaciones ==========
 cd "${PROJECT_DIR}"
 if [[ ! -f composer.json ]]; then
   echo "❌ No se encontró composer.json en $(pwd). ¿Estás en un proyecto Laravel?"
   exit 1
 fi
-if ! command -v composer >/dev/null 2>&1; then
-  echo "❌ composer no está instalado en el host."
-  exit 1
-fi
 
 # ========== Instalar Sail y generar compose ==========
-echo "📦 Instalando laravel/sail..."
-composer require laravel/sail --dev --no-interaction --no-progress
-composer dump-autoload --no-interaction >/dev/null 2>&1 || true
+echo "📦 Instalando laravel/sail (ignorando requisitos de plataforma SOLO en este paso)..."
+# Ignora TODOS los platform-reqs del proyecto (intl, gd, etc.) SOLO para agregar Sail
+COMPOSER_SAIL_FLAGS=(--dev --no-interaction --no-progress --ignore-platform-reqs)
+composer_exec require laravel/sail "${COMPOSER_SAIL_FLAGS[@]}" || {
+  echo "❌ Falló composer require laravel/sail (incluso ignorando platform-reqs)."
+  exit 1
+}
+composer_exec dump-autoload --no-interaction >/dev/null 2>&1 || true
 
 echo "⚙️ Ejecutando php artisan sail:install --with=\"$SERVICES\""
-php artisan sail:install --with="$SERVICES" --no-interaction
+php_exec artisan sail:install --with="$SERVICES" --no-interaction
 
-# ========== Ajustar Dockerfile de la app (PHP/Node) ==========
-DOCKERFILE=$(grep -RIl "laravelsail/php" docker dockerfiles . 2>/dev/null | head -n1 || true)
+# ========== Localizar Dockerfile real de Sail y ajustar PHP/Node + intl+gd ==========
+COMPOSE="docker-compose.yml"
+DOCKERFILE=""
+RUNTIME_DIR=""
+
+# 1) Preferimos el runtime segun PHP_VERSION: vendor/laravel/sail/runtimes/<PHP_VERSION>/Dockerfile
+CANDIDATE="vendor/laravel/sail/runtimes/${PHP_VERSION}/Dockerfile"
+if [[ -f "${CANDIDATE}" ]]; then
+  RUNTIME_DIR="vendor/laravel/sail/runtimes/${PHP_VERSION}"
+  DOCKERFILE="${CANDIDATE}"
+  # Actualizar docker-compose.yml para que apunte a ese runtime (si existe compose)
+  if [[ -f "${COMPOSE}" ]]; then
+    sed -i.bak -E "s|runtimes/[0-9]+\.[0-9]+|runtimes/${PHP_VERSION}|g" "${COMPOSE}" || true
+  fi
+fi
+
+# 2) Si no existe el runtime exacto, tomamos el primero disponible bajo vendor/laravel/sail/runtimes/*
+if [[ -z "${DOCKERFILE}" ]]; then
+  DOCKERFILE=$(find vendor/laravel/sail/runtimes -maxdepth 2 -type f -name "Dockerfile" 2>/dev/null | head -n1 || true)
+  [[ -n "${DOCKERFILE}" ]] && RUNTIME_DIR="$(dirname "${DOCKERFILE}")"
+fi
+
+# 3) Si tampoco aparece, intentamos leer el contexto de build del compose (laravel.test)
+if [[ -z "${DOCKERFILE}" && -f "${COMPOSE}" ]]; then
+  # Extraer context y dockerfile del servicio laravel.test con awk básico (sin yq)
+  CONTEXT_PATH=$(awk '
+    BEGIN{in_service=0}
+    /^[[:space:]]*services:/{in_services=1}
+    in_services && /^[[:space:]]*laravel\.test:/{in_service=1; next}
+    in_service && /^[[:space:]]*[a-zA-Z0-9_.-]+:/{exit}  # fin del bloque del servicio
+    in_service && $1 ~ /context:/ {print $2; exit}
+  ' "${COMPOSE}" 2>/dev/null || true)
+
+  DOCKERFILE_NAME=$(awk '
+    BEGIN{in_service=0}
+    /^[[:space:]]*services:/{in_services=1}
+    in_services && /^[[:space:]]*laravel\.test:/{in_service=1; next}
+    in_service && /^[[:space:]]*[a-zA-Z0-9_.-]+:/{exit}
+    in_service && $1 ~ /dockerfile:/ {print $2; exit}
+  ' "${COMPOSE}" 2>/dev/null || true)
+
+  [[ -z "${DOCKERFILE_NAME:-}" ]] && DOCKERFILE_NAME="Dockerfile"
+  if [[ -n "${CONTEXT_PATH:-}" && -f "${CONTEXT_PATH}/${DOCKERFILE_NAME}" ]]; then
+    RUNTIME_DIR="${CONTEXT_PATH}"
+    DOCKERFILE="${CONTEXT_PATH}/${DOCKERFILE_NAME}"
+  fi
+fi
+
 if [[ -n "${DOCKERFILE}" && -f "${DOCKERFILE}" ]]; then
   echo "🧩 Ajustando Dockerfile: ${DOCKERFILE}"
-  PHP_TAG="$(echo "$PHP_VERSION" | tr -d '.')"
-  sed -i.bak -E "s|(laravelsail/php)[0-9]+(-composer)?|\1${PHP_TAG}\2|g" "${DOCKERFILE}" || true
-  if grep -qE 'ARG NODE_VERSION=' "${DOCKERFILE}"; then
-    sed -i.bak -E "s|ARG NODE_VERSION=.*|ARG NODE_VERSION=${NODE_VERSION}|g" "${DOCKERFILE}"
+
+  # Asegurar ARG NODE_VERSION (lo insertamos si no existe)
+  if grep -qE '^ARG[[:space:]]+NODE_VERSION=' "${DOCKERFILE}"; then
+    sed -i.bak -E "s|^ARG[[:space:]]+NODE_VERSION=.*|ARG NODE_VERSION=${NODE_VERSION}|g" "${DOCKERFILE}"
   else
     awk -v nv="${NODE_VERSION}" '
       BEGIN{printed=0}
-      /^FROM / && printed==0 { print; print "ARG NODE_VERSION=" nv; printed=1; next }
+      /^FROM[[:space:]]/ && printed==0 { print; print "ARG NODE_VERSION=" nv; printed=1; next }
+      { print }
+    ' "${DOCKERFILE}" > "${DOCKERFILE}.tmp" && mv "${DOCKERFILE}.tmp" "${DOCKERFILE}"
+  fi
+
+  # Inyectar intl + gd si no están
+  need_inject="false"
+  grep -qiE 'docker-php-ext-install[[:space:]].*intl' "${DOCKERFILE}" || need_inject="true"
+  grep -qiE 'docker-php-ext-install[[:space:]].*gd'   "${DOCKERFILE}" || need_inject="true"
+
+  if [[ "$need_inject" == "true" ]]; then
+    echo "➕ Inyectando instalación de intl y gd en ${DOCKERFILE}"
+    # Insertar tras la PRIMERA línea FROM para máxima compatibilidad
+    awk '
+      BEGIN{inserted=0}
+      /^FROM[[:space:]]/ && inserted==0 {
+        print
+        print "RUN apt-get update \\"
+        print "    && apt-get install -y --no-install-recommends \\"
+        print "       libicu-dev libjpeg62-turbo-dev libpng-dev libfreetype6-dev libwebp-dev \\"
+        print "    && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \\"
+        print "    && docker-php-ext-install gd \\"
+        print "    && docker-php-ext-configure intl \\"
+        print "    && docker-php-ext-install intl \\"
+        print "    && rm -rf /var/lib/apt/lists/*"
+        inserted=1
+        next
+      }
       { print }
     ' "${DOCKERFILE}" > "${DOCKERFILE}.tmp" && mv "${DOCKERFILE}.tmp" "${DOCKERFILE}"
   fi
 else
-  echo "⚠️ No pude localizar el Dockerfile de Sail para forzar PHP/Node. Ajustá manual si lo necesitás."
+  echo "⚠️ No pude localizar el Dockerfile de Sail."
+  echo "   Busqué en vendor/laravel/sail/runtimes y en docker-compose.yml (laravel.test)."
+  echo "   Decime dónde está tu Dockerfile y lo adapto al toque."
 fi
 
 # ========== pgAdmin si hay pgsql ==========
@@ -153,7 +281,6 @@ if [[ -f "${COMPOSE}" && "${PHPMYADMIN}" == "true" ]]; then
       echo "➕ Agregando servicio phpmyadmin a ${COMPOSE}"
       PMA_TARGET="mysql"
       grep -qE '^\s*mariadb:' "${COMPOSE}" && PMA_TARGET="mariadb"
-      grep -qE '^\s*mysql:' "${COMPOSE}" && PMA_TARGET="mysql"
 
       cat >> "${COMPOSE}" <<YAML
 
@@ -192,4 +319,11 @@ if echo "$SERVICES" | grep -q "sqlite"; then
   fi
 fi
 
-echo "✅ Sail listo en $(pwd). Levantá con: ./vendor/bin/sail up -d"
+echo "✅ Sail listo en $(pwd)."
+echo "➡️ Construí la imagen para aplicar intl/gd y Node:"
+echo "   ./vendor/bin/sail build --no-cache"
+echo "   ./vendor/bin/sail up -d"
+echo "🔎 Verificá intl y gd:"
+echo "   ./vendor/bin/sail php -m | grep -Ei 'intl|gd' || echo 'extensiones NO cargadas'"
+echo "📦 Luego instalá dependencias normalmente (sin ignorar requisitos):"
+echo "   ./vendor/bin/sail composer install"
